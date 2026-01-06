@@ -32,9 +32,9 @@ func (p *Processor) Run(ctx context.Context, result <-chan models.Result) {
 
 func (p *Processor) process(res models.Result) {
 	if res.Err != nil {
-		fmt.Printf("[ERROR] ID:%d | Err: %v\n", res.TargetID, res.Err)
+		fmt.Printf("[ERROR] %s (ID:%d) | Err: %v\n", res.URL, res.TargetID, res.Err)
 		return
 	}
 
-	fmt.Printf("[%d] ID:%d | Time: %dms\n", res.StasusCode, res.TargetID, res.ResponseTime.Milliseconds())
+	fmt.Printf("[%d] %s (ID:%d) | Time: %dms\n", res.StatusCode, res.URL, res.TargetID, res.ResponseTime.Milliseconds())
 }

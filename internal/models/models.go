@@ -10,7 +10,8 @@ type Target struct {
 
 type Result struct {
 	TargetID     int
-	StasusCode   int
+	URL          string
+	StatusCode   int
 	ResponseTime time.Duration
 	Timestamp    time.Time
 	Err          error

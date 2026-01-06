@@ -27,35 +27,36 @@ func NewWorker() *Worker {
 func (w *Worker) check(ctx context.Context, target models.Target) models.Result {
 	start := time.Now()
 
+	res := models.Result{
+		TargetID:  target.ID,
+		URL:       target.URL,
+		Timestamp: time.Now(),
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.URL, nil)
 	if err != nil {
-		return models.Result{
-			TargetID:  target.ID,
-			Err:       err,
-			Timestamp: time.Now()}
+		res.Err = err
+		return res
 	}
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return models.Result{
-			TargetID:     target.ID,
-			Err:          err,
-			ResponseTime: time.Since(start),
-			Timestamp:    time.Now()}
+		res.Err = err
+		res.ResponseTime = time.Since(start)
+		return res
 	}
 	defer resp.Body.Close()
 
-	return models.Result{
-		TargetID:     target.ID,
-		StasusCode:   resp.StatusCode,
-		ResponseTime: time.Since(start),
-		Timestamp:    time.Now()}
+	res.StatusCode = resp.StatusCode
+	res.ResponseTime = time.Since(start)
+	return res
+
 }
 
-func (w *Worker) start(ctx context.Context, tasks <-chan models.Target, results chan<- models.Result) {
+func (w *Worker) Start(ctx context.Context, tasks <-chan models.Target, results chan<- models.Result) {
 	for {
 		select {
 		case <-ctx.Done():
