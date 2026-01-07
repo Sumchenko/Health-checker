@@ -4,13 +4,18 @@ import (
 	"context"
 	"fmt"
 	"health-checker/internal/models"
+	"health-checker/internal/storage"
+	"log"
 )
 
 type Processor struct {
+	store *storage.Storage
 }
 
-func NewProcessor() *Processor {
-	return &Processor{}
+func NewProcessor(store *storage.Storage) *Processor {
+	return &Processor{
+		store: store,
+	}
 }
 
 func (p *Processor) Run(ctx context.Context, result <-chan models.Result) {
@@ -31,6 +36,10 @@ func (p *Processor) Run(ctx context.Context, result <-chan models.Result) {
 }
 
 func (p *Processor) process(res models.Result) {
+	err := p.store.SaveResult(res)
+	if err != nil {
+		log.Printf("[DB ERROR] Не удалось сохранить результат: %v", err)
+	}
 	if res.Err != nil {
 		fmt.Printf("[ERROR] %s (ID:%d) | Err: %v\n", res.URL, res.TargetID, res.Err)
 		return
