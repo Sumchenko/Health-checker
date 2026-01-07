@@ -40,14 +40,13 @@ jobs:
       - name: Verify dependencies
         run: go mod verify
 
+      - name: Run Tests
         env:
           DB_HOST: localhost
           DB_PORT: 5432
           DB_USER: user
           DB_PASSWORD: password
           DB_NAME: health_db
-
-      - name: Run Tests
         run: go test -v ./...
 
       - name: Build Application
