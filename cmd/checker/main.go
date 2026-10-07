@@ -2,63 +2,88 @@ package main
 
 import (
 	"context"
+	"health-checker/internal/config"
 	"health-checker/internal/models"
 	"health-checker/internal/processor"
 	"health-checker/internal/scheduler"
 	"health-checker/internal/storage"
 	"health-checker/internal/worker"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
-	"time"
 )
 
 func main() {
-	dbHost := getEnv("DB_HOST", "localhost")
-	dbPort := getEnv("DB_PORT", "5432")
-	dbUser := getEnv("DB_USER", "postgres")
-	dbPass := getEnv("DB_PASSWORD", "password")
-	dbName := getEnv("DB_NAME", "health_db")
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 
-	store, err := storage.NewStorage(dbHost, dbPort, dbUser, dbPass, dbName)
+	if err := run(); err != nil {
+		slog.Error("сервис остановлен с ошибкой", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Ошибка инициализации хранилища: %v", err)
+		return err
 	}
-	defer store.Close()
-
-	targets := []models.Target{
-		{ID: 1, URL: "https://google.com"},
-		{ID: 2, URL: "https://github.com"},
-		{ID: 3, URL: "https://non-existent-site-123.com"},
-	}
-
-	taskChan := make(chan models.Target, 10)
-	resultChan := make(chan models.Result, 10)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	sched := scheduler.NewScheduler(targets)
-	wrk := worker.NewWorker()
+	store, err := storage.New(ctx, cfg.DB.DSN())
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+
+	// Временно захардкожены — на этапе 2 цели переедут в БД.
+	targets := []models.Target{
+		{ID: 1, Name: "Google", URL: "https://google.com"},
+		{ID: 2, Name: "GitHub", URL: "https://github.com"},
+		{ID: 3, Name: "Несуществующий сайт", URL: "https://non-existent-site-123.com"},
+	}
+
+	taskChan := make(chan models.Target, len(targets))
+	resultChan := make(chan models.Result, cfg.Workers)
+
+	sched := scheduler.NewScheduler(targets, cfg.CheckInterval)
+	wrk := worker.NewWorker(cfg.CheckTimeout)
 	proc := processor.NewProcessor(store)
 
+	// Порядок остановки: ctx отменён → планировщик закрывает taskChan → воркеры завершаются →
+	// закрываем resultChan → процессор дописывает оставшиеся результаты → закрываем БД.
 	go sched.Run(ctx, taskChan)
 
-	for i := 0; i < 3; i++ {
-		go wrk.Start(ctx, taskChan, resultChan)
+	var workers sync.WaitGroup
+	for range cfg.Workers {
+		workers.Go(func() { wrk.Start(ctx, taskChan, resultChan) })
 	}
 
-	go proc.Run(ctx, resultChan)
-	log.Println("Сервис запущен. Нажми Ctrl+C для остановки...")
+	procDone := make(chan struct{})
+	go func() {
+		proc.Run(resultChan)
+		close(procDone)
+	}()
+
+	slog.Info("сервис запущен",
+		"targets", len(targets),
+		"workers", cfg.Workers,
+		"interval", cfg.CheckInterval,
+		"timeout", cfg.CheckTimeout,
+	)
+
 	<-ctx.Done()
-	log.Println("Завершение работы...")
-	time.Sleep(time.Second)
-}
+	// Возвращаем стандартную обработку сигналов: повторный Ctrl+C завершит процесс сразу.
+	cancel()
+	slog.Info("получен сигнал остановки, завершаем работу...")
 
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
-	}
-	return fallback
+	workers.Wait()
+	close(resultChan)
+	<-procDone
+
+	slog.Info("сервис остановлен")
+	return nil
 }

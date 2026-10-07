@@ -3,37 +3,54 @@ package scheduler
 import (
 	"context"
 	"health-checker/internal/models"
+	"sync"
 	"time"
 )
 
 type Scheduler struct {
-	targets []models.Target
+	targets         []models.Target
+	defaultInterval time.Duration
 }
 
-func NewScheduler(targets []models.Target) *Scheduler {
+func NewScheduler(targets []models.Target, defaultInterval time.Duration) *Scheduler {
 	return &Scheduler{
-		targets: targets,
+		targets:         targets,
+		defaultInterval: defaultInterval,
 	}
 }
 
+// Run ставит цели в очередь каждую со своим интервалом. Возвращается после отмены ctx
+// и закрывает канал tasks, чтобы воркеры могли завершиться.
 func (s *Scheduler) Run(ctx context.Context, tasks chan<- models.Target) {
-	s.sendTasks(tasks)
+	defer close(tasks)
 
-	ticker := time.NewTicker(30 * time.Second)
+	var wg sync.WaitGroup
+	for _, t := range s.targets {
+		wg.Go(func() { s.runTarget(ctx, t, tasks) })
+	}
+	wg.Wait()
+}
+
+func (s *Scheduler) runTarget(ctx context.Context, t models.Target, tasks chan<- models.Target) {
+	interval := t.Interval
+	if interval <= 0 {
+		interval = s.defaultInterval
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case tasks <- t:
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			s.sendTasks(tasks)
 		}
-	}
-}
 
-func (s *Scheduler) sendTasks(tasks chan<- models.Target) {
-	for _, t := range s.targets {
-		tasks <- t
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		}
 	}
 }

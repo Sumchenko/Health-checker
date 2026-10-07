@@ -2,48 +2,52 @@ package processor
 
 import (
 	"context"
-	"fmt"
 	"health-checker/internal/models"
-	"health-checker/internal/storage"
-	"log"
+	"log/slog"
+	"time"
 )
 
-type Processor struct {
-	store *storage.Storage
+const saveTimeout = 5 * time.Second
+
+type ResultSaver interface {
+	SaveResult(ctx context.Context, res models.Result) error
 }
 
-func NewProcessor(store *storage.Storage) *Processor {
+type Processor struct {
+	store ResultSaver
+}
+
+func NewProcessor(store ResultSaver) *Processor {
 	return &Processor{
 		store: store,
 	}
 }
 
-func (p *Processor) Run(ctx context.Context, result <-chan models.Result) {
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("Processor: остановка обработки...")
-			return
-
-		case res, ok := <-result:
-			if !ok {
-				return
-			}
-
-			p.process(res)
-		}
+// Run сохраняет результаты, пока канал не закрыт. Контекст не принимает намеренно:
+// при остановке сервиса нужно дописать всё, что воркеры успели отправить.
+func (p *Processor) Run(results <-chan models.Result) {
+	for res := range results {
+		p.process(res)
 	}
 }
 
 func (p *Processor) process(res models.Result) {
-	err := p.store.SaveResult(res)
-	if err != nil {
-		log.Printf("[DB ERROR] Не удалось сохранить результат: %v", err)
-	}
-	if res.Err != nil {
-		fmt.Printf("[ERROR] %s (ID:%d) | Err: %v\n", res.URL, res.TargetID, res.Err)
-		return
+	ctx, cancel := context.WithTimeout(context.Background(), saveTimeout)
+	defer cancel()
+
+	if err := p.store.SaveResult(ctx, res); err != nil {
+		slog.Error("не удалось сохранить результат", "target_id", res.TargetID, "url", res.URL, "err", err)
 	}
 
-	fmt.Printf("[%d] %s (ID:%d) | Time: %dms\n", res.StatusCode, res.URL, res.TargetID, res.ResponseTime.Milliseconds())
+	attrs := []any{
+		"target_id", res.TargetID,
+		"url", res.URL,
+		"status", res.StatusCode,
+		"time_ms", res.ResponseTime.Milliseconds(),
+	}
+	if !res.IsUp {
+		slog.Warn("цель недоступна", append(attrs, "err", res.Error)...)
+		return
+	}
+	slog.Info("цель доступна", attrs...)
 }
