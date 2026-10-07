@@ -4,12 +4,13 @@ import (
 	"context"
 	"health-checker/internal/config"
 	"health-checker/internal/models"
+	"maps"
 	"os"
 	"testing"
 	"time"
 )
 
-// Интеграционный тест: нужен запущенный Postgres и переменные DB_*.
+// Интеграционные тесты: нужен запущенный Postgres и переменные DB_*.
 func newTestStorage(t *testing.T) *Storage {
 	t.Helper()
 	if os.Getenv("DB_HOST") == "" {
@@ -29,6 +30,19 @@ func newTestStorage(t *testing.T) *Storage {
 	}
 	t.Cleanup(store.Close)
 	return store
+}
+
+// insertTarget создаёт цель напрямую в БД и удаляет её (вместе с историей) после теста.
+func insertTarget(t *testing.T, store *Storage, sql string, args ...any) int {
+	t.Helper()
+	var id int
+	if err := store.pool.QueryRow(context.Background(), sql+" RETURNING id", args...).Scan(&id); err != nil {
+		t.Fatalf("создание цели: %v", err)
+	}
+	t.Cleanup(func() {
+		store.pool.Exec(context.Background(), "DELETE FROM targets WHERE id = $1", id)
+	})
+	return id
 }
 
 func TestMigrations_Idempotent(t *testing.T) {
@@ -53,14 +67,46 @@ func TestMigrations_Idempotent(t *testing.T) {
 	}
 }
 
+func TestListEnabledTargets(t *testing.T) {
+	store := newTestStorage(t)
+
+	fullID := insertTarget(t, store, `
+		INSERT INTO targets (name, url, expected_status, keyword, headers, interval_seconds, timeout_seconds)
+		VALUES ('Supabase', 'https://abc.supabase.co/rest/v1/', 200, 'ok', '{"apikey": "anon"}', 300, 20)`)
+	defaultsID := insertTarget(t, store, `INSERT INTO targets (name, url) VALUES ('Портфолио', 'https://example.com')`)
+	disabledID := insertTarget(t, store, `INSERT INTO targets (name, url, enabled) VALUES ('Выключен', 'https://off.test', false)`)
+
+	targets, err := store.ListEnabledTargets(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[int]models.Target)
+	for _, tg := range targets {
+		byID[tg.ID] = tg
+	}
+
+	if _, ok := byID[disabledID]; ok {
+		t.Error("выключенная цель не должна возвращаться")
+	}
+
+	full := byID[fullID]
+	if full.Name != "Supabase" || full.ExpectedStatus != 200 || full.Keyword != "ok" ||
+		full.Interval != 5*time.Minute || full.Timeout != 20*time.Second || !full.Enabled ||
+		!maps.Equal(full.Headers, map[string]string{"apikey": "anon"}) {
+		t.Errorf("неверно прочитана цель со всеми настройками: %+v", full)
+	}
+
+	def := byID[defaultsID]
+	if def.URL != "https://example.com" || def.ExpectedStatus != 0 || def.Keyword != "" ||
+		def.Interval != 0 || def.Timeout != 0 || len(def.Headers) != 0 {
+		t.Errorf("незаданные настройки должны читаться нулями: %+v", def)
+	}
+}
+
 func TestSaveResult(t *testing.T) {
 	store := newTestStorage(t)
 	ctx := context.Background()
-	const targetID = -1 // отрицательный ID, чтобы не пересекаться с реальными целями
-
-	t.Cleanup(func() {
-		store.pool.Exec(context.Background(), "DELETE FROM health_checks WHERE target_id = $1", targetID)
-	})
+	targetID := insertTarget(t, store, `INSERT INTO targets (name, url) VALUES ('Тест', 'https://up.test')`)
 
 	checkedAt := time.Now().Truncate(time.Microsecond)
 	results := []models.Result{
@@ -110,5 +156,14 @@ func TestSaveResult(t *testing.T) {
 	}
 	if !up.checkedAt.Equal(checkedAt) {
 		t.Errorf("checked_at = %v, want %v (сдвиг часового пояса?)", up.checkedAt, checkedAt)
+	}
+}
+
+func TestSaveResult_UnknownTarget(t *testing.T) {
+	store := newTestStorage(t)
+
+	err := store.SaveResult(context.Background(), models.Result{TargetID: -1, URL: "https://x.test", CheckedAt: time.Now()})
+	if err == nil {
+		t.Error("результат для несуществующей цели должен отклоняться внешним ключом")
 	}
 }

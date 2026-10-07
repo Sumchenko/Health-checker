@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ const maxBodySize = 1 << 20
 
 const userAgent = "health-checker/1.0"
 
+// Worker выполняет HTTP-проверки целей. Безопасен для одновременного использования.
 type Worker struct {
 	client         *http.Client
 	defaultTimeout time.Duration
@@ -29,27 +31,6 @@ func NewWorker(defaultTimeout time.Duration) *Worker {
 		// Таймаут задаётся контекстом каждого запроса, чтобы у целей мог быть свой.
 		client:         &http.Client{Transport: transport},
 		defaultTimeout: defaultTimeout,
-	}
-}
-
-// Start обрабатывает задачи, пока канал tasks не закрыт или не отменён ctx.
-func (w *Worker) Start(ctx context.Context, tasks <-chan models.Target, results chan<- models.Result) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case task, ok := <-tasks:
-			if !ok {
-				return
-			}
-
-			res := w.Check(ctx, task)
-			// Проверка, прерванная остановкой сервиса, ничего не говорит о цели — не сохраняем её.
-			if !res.IsUp && ctx.Err() != nil {
-				return
-			}
-			results <- res
-		}
 	}
 }
 
@@ -74,6 +55,9 @@ func (w *Worker) Check(ctx context.Context, target models.Target) models.Result 
 		return res
 	}
 	req.Header.Set("User-Agent", userAgent)
+	for name, value := range target.Headers {
+		req.Header.Set(name, value)
+	}
 
 	start := time.Now()
 	resp, err := w.client.Do(req)
@@ -87,20 +71,42 @@ func (w *Worker) Check(ctx context.Context, target models.Target) models.Result 
 	res.StatusCode = resp.StatusCode
 
 	// Вычитываем тело: время ответа включает загрузку страницы, а соединение возвращается в пул.
-	_, err = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodySize))
+	// Целиком в память читаем, только если нужно искать ключевое слово.
+	var body []byte
+	limited := io.LimitReader(resp.Body, maxBodySize)
+	if target.Keyword != "" {
+		body, err = io.ReadAll(limited)
+	} else {
+		_, err = io.Copy(io.Discard, limited)
+	}
 	res.ResponseTime = time.Since(start)
 	if err != nil {
 		res.Error = "ошибка чтения ответа: " + describeError(err, timeout)
 		return res
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	if !statusOK(resp.StatusCode, target.ExpectedStatus) {
 		res.Error = fmt.Sprintf("неожиданный HTTP-код %d", resp.StatusCode)
+		if target.ExpectedStatus != 0 {
+			res.Error += fmt.Sprintf(" (ожидался %d)", target.ExpectedStatus)
+		}
+		return res
+	}
+
+	if target.Keyword != "" && !bytes.Contains(body, []byte(target.Keyword)) {
+		res.Error = fmt.Sprintf("в ответе нет ключевого слова %q", target.Keyword)
 		return res
 	}
 
 	res.IsUp = true
 	return res
+}
+
+func statusOK(code, expected int) bool {
+	if expected != 0 {
+		return code == expected
+	}
+	return code >= 200 && code <= 299
 }
 
 func describeError(err error, timeout time.Duration) string {

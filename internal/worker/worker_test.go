@@ -100,32 +100,68 @@ func TestCheck_DefaultTimeout(t *testing.T) {
 	}
 }
 
-func TestStart_DropsResultsInterruptedByShutdown(t *testing.T) {
+func TestCheck_TargetOptions(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
+		if r.Header.Get("apikey") != "secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path == "/created" {
+			w.WriteHeader(http.StatusCreated)
+		}
+		w.Write([]byte("<h1>Привет, работодатель!</h1>"))
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	tasks := make(chan models.Target, 1)
-	results := make(chan models.Result, 1)
-	tasks <- models.Target{URL: srv.URL}
-
-	done := make(chan struct{})
-	go func() {
-		NewWorker(10*time.Second).Start(ctx, tasks, results)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("воркер не завершился после отмены контекста")
+	headers := map[string]string{"apikey": "secret"}
+	tests := []struct {
+		name      string
+		target    models.Target
+		wantUp    bool
+		wantError string
+	}{
+		{
+			name:   "заголовки передаются",
+			target: models.Target{URL: srv.URL, Headers: headers},
+			wantUp: true,
+		},
+		{
+			name:      "без заголовка — 401",
+			target:    models.Target{URL: srv.URL},
+			wantError: "неожиданный HTTP-код 401",
+		},
+		{
+			name:   "ключевое слово найдено",
+			target: models.Target{URL: srv.URL, Headers: headers, Keyword: "работодатель"},
+			wantUp: true,
+		},
+		{
+			name:      "ключевого слова нет",
+			target:    models.Target{URL: srv.URL, Headers: headers, Keyword: "Internal Server Error"},
+			wantError: "в ответе нет ключевого слова",
+		},
+		{
+			name:   "ожидаемый код совпал",
+			target: models.Target{URL: srv.URL + "/created", Headers: headers, ExpectedStatus: http.StatusCreated},
+			wantUp: true,
+		},
+		{
+			name:      "ожидался другой код",
+			target:    models.Target{URL: srv.URL, Headers: headers, ExpectedStatus: http.StatusCreated},
+			wantError: "неожиданный HTTP-код 200 (ожидался 201)",
+		},
 	}
-	if len(results) != 0 {
-		t.Errorf("прерванная проверка не должна сохраняться, получено %+v", <-results)
+
+	w := NewWorker(time.Second)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := w.Check(context.Background(), tt.target)
+			if res.IsUp != tt.wantUp {
+				t.Errorf("IsUp = %v, want %v (err: %q)", res.IsUp, tt.wantUp, res.Error)
+			}
+			if !strings.Contains(res.Error, tt.wantError) {
+				t.Errorf("Error = %q, want contains %q", res.Error, tt.wantError)
+			}
+		})
 	}
 }

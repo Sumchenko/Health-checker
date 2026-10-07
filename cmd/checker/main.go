@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 )
 
@@ -39,50 +38,31 @@ func run() error {
 	}
 	defer store.Close()
 
-	// Временно захардкожены — на этапе 2 цели переедут в БД.
-	targets := []models.Target{
-		{ID: 1, Name: "Google", URL: "https://google.com"},
-		{ID: 2, Name: "GitHub", URL: "https://github.com"},
-		{ID: 3, Name: "Несуществующий сайт", URL: "https://non-existent-site-123.com"},
-	}
-
-	taskChan := make(chan models.Target, len(targets))
-	resultChan := make(chan models.Result, cfg.Workers)
-
-	sched := scheduler.NewScheduler(targets, cfg.CheckInterval)
-	wrk := worker.NewWorker(cfg.CheckTimeout)
+	sched := scheduler.New(store, worker.NewWorker(cfg.CheckTimeout), scheduler.Config{
+		DefaultInterval: cfg.CheckInterval,
+		ReloadInterval:  cfg.ReloadInterval,
+		MaxConcurrent:   cfg.Workers,
+	})
 	proc := processor.NewProcessor(store)
+	results := make(chan models.Result, cfg.Workers)
 
-	// Порядок остановки: ctx отменён → планировщик закрывает taskChan → воркеры завершаются →
-	// закрываем resultChan → процессор дописывает оставшиеся результаты → закрываем БД.
-	go sched.Run(ctx, taskChan)
-
-	var workers sync.WaitGroup
-	for range cfg.Workers {
-		workers.Go(func() { wrk.Start(ctx, taskChan, resultChan) })
-	}
-
-	procDone := make(chan struct{})
 	go func() {
-		proc.Run(resultChan)
-		close(procDone)
+		<-ctx.Done()
+		// Возвращаем стандартную обработку сигналов: повторный Ctrl+C завершит процесс сразу.
+		cancel()
 	}()
 
 	slog.Info("сервис запущен",
-		"targets", len(targets),
-		"workers", cfg.Workers,
-		"interval", cfg.CheckInterval,
-		"timeout", cfg.CheckTimeout,
+		"default_interval", cfg.CheckInterval,
+		"default_timeout", cfg.CheckTimeout,
+		"reload_interval", cfg.ReloadInterval,
+		"max_concurrent", cfg.Workers,
 	)
 
-	<-ctx.Done()
-	// Возвращаем стандартную обработку сигналов: повторный Ctrl+C завершит процесс сразу.
-	cancel()
-	slog.Info("получен сигнал остановки, завершаем работу...")
-
-	workers.Wait()
-	close(resultChan)
-	<-procDone
+	// Порядок остановки: ctx отменён → планировщик дожидается всех проверок и закрывает results →
+	// процессор дописывает оставшиеся результаты и возвращается → закрываем БД.
+	go sched.Run(ctx, results)
+	proc.Run(results)
 
 	slog.Info("сервис остановлен")
 	return nil

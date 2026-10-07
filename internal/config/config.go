@@ -15,7 +15,9 @@ type Config struct {
 	CheckInterval time.Duration
 	// CheckTimeout — таймаут одной проверки по умолчанию.
 	CheckTimeout time.Duration
-	// Workers — количество параллельных воркеров, выполняющих проверки.
+	// ReloadInterval — как часто перечитывать список целей из БД.
+	ReloadInterval time.Duration
+	// Workers — максимум одновременно выполняющихся проверок.
 	Workers int
 }
 
@@ -59,12 +61,15 @@ func Load() (Config, error) {
 	if cfg.CheckTimeout, err = getDuration("CHECK_TIMEOUT", 15*time.Second); err != nil {
 		return Config{}, err
 	}
+	if cfg.ReloadInterval, err = getDuration("TARGETS_RELOAD_INTERVAL", 10*time.Second); err != nil {
+		return Config{}, err
+	}
 	if cfg.Workers, err = getInt("WORKERS", 5); err != nil {
 		return Config{}, err
 	}
 
-	if cfg.CheckInterval <= 0 || cfg.CheckTimeout <= 0 || cfg.Workers <= 0 {
-		return Config{}, fmt.Errorf("CHECK_INTERVAL, CHECK_TIMEOUT и WORKERS должны быть положительными")
+	if cfg.CheckInterval <= 0 || cfg.CheckTimeout <= 0 || cfg.ReloadInterval <= 0 || cfg.Workers <= 0 {
+		return Config{}, fmt.Errorf("CHECK_INTERVAL, CHECK_TIMEOUT, TARGETS_RELOAD_INTERVAL и WORKERS должны быть положительными")
 	}
 
 	return cfg, nil
